@@ -1,0 +1,4 @@
+﻿# run output, regenerated on every run
+fresh.log
+*.log
+
