@@ -1,4 +1,11 @@
-﻿# run output, regenerated on every run
-fresh.log
-*.log
+param(
+    [int]$IntervalSeconds = 30,
+    [switch]$NoGui,
+    [switch]$PublicApi
+)
 
+Import-Module (Join-Path $PSScriptRoot "TorIPChanger.psm1") -Force
+
+$process = Start-TorIPChanger -IntervalSeconds $IntervalSeconds -NoGui:$NoGui -PublicApi:$PublicApi
+Write-Host "Tor IP changer process started with PID: $($process.Id)" -ForegroundColor Green
+Write-Host "Current exit IP: $(Get-TorIP)" -ForegroundColor Cyan

@@ -1,86 +1,139 @@
-param(
-    [Parameter(Mandatory=$false)]
-    [int]$IntervalSeconds = 30,
-    [Parameter(Mandatory=$false)]
-    [string]$TorIPChangerPath = "./tor-ip-changer"
-)
+Set-StrictMode -Version Latest
 
-<#
-.SYNOPSIS
-PowerShell wrapper to integrate tor-ip-changer Python tool
-.DESCRIPTION
-Manages Tor IP rotation with configurable intervals
-#>
+$script:TorRepoInstallRoot = Join-Path $PSScriptRoot "tools"
+$script:TorRepoPath = Join-Path $script:TorRepoInstallRoot "tor-ip-changer"
 
-# Validate Python is installed
-try {
-    $pythonVersion = python --version 2>&1
-    Write-Host "✓ Python found: $pythonVersion"
-} catch {
-    Write-Error "Python is required but not installed. Install from https://python.org/"
-    exit 1
-}
+function Ensure-Command {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+        [string]$InstallHint
+    )
 
-# Validate Tor IP Changer repository exists
-if (-not (Test-Path $TorIPChangerPath)) {
-    Write-Error "tor-ip-changer directory not found at: $TorIPChangerPath"
-    exit 1
-}
-
-$torScript = Join-Path $TorIPChangerPath "torip.py"
-if (-not (Test-Path $torScript)) {
-    Write-Error "torip.py not found at: $torScript"
-    exit 1
-}
-
-# Install dependencies
-Write-Host "Installing Python dependencies..." -ForegroundColor Cyan
-Push-Location $TorIPChangerPath
-try {
-    pip install -q requests stem 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "✓ Dependencies installed successfully" -ForegroundColor Green
-    } else {
-        Write-Warning "Dependency installation completed with warnings"
+    if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
+        throw "Required command '$Name' was not found. $InstallHint"
     }
-} catch {
-    Write-Error "Failed to install dependencies: $_"
-    exit 1
-} finally {
-    Pop-Location
 }
 
-# Validate Tor is running
-Write-Host "Checking Tor daemon..." -ForegroundColor Cyan
-$torCheck = @"
+function Ensure-TorIPChanger {
+    [CmdletBinding()]
+    param(
+        [string]$InstallPath = $script:TorRepoPath
+    )
+
+    Ensure-Command -Name git -InstallHint "Install Git and try again."
+
+    $pythonName = if ($IsWindows) { "python" } else { "python3" }
+    Ensure-Command -Name $pythonName -InstallHint "Install Python 3 and ensure it is on PATH."
+
+    if (-not (Test-Path $InstallPath)) {
+        New-Item -ItemType Directory -Path $script:TorRepoInstallRoot -Force | Out-Null
+        Write-Host "Cloning tor-ip-changer into $InstallPath..." -ForegroundColor Cyan
+        git clone --depth 1 https://github.com/seevik2580/tor-ip-changer.git $InstallPath | Out-Null
+    }
+
+    $sourceDir = Join-Path $InstallPath "source-code"
+    if (-not (Test-Path $sourceDir)) {
+        throw "Expected tor-ip-changer source directory not found at $sourceDir."
+    }
+
+    $requirementsFile = if ($IsWindows) {
+        Join-Path $sourceDir "requirements/windows/pip-requirements.txt"
+    }
+    else {
+        Join-Path $sourceDir "requirements/linux/pip-requirements.txt"
+    }
+
+    if (-not (Test-Path $requirementsFile)) {
+        throw "Missing requirements file: $requirementsFile"
+    }
+
+    Write-Host "Installing upstream tor-ip-changer Python requirements..." -ForegroundColor Cyan
+    & $pythonName -m pip install --quiet -r $requirementsFile
+
+    return $InstallPath
+}
+
+function Start-TorIPChanger {
+    [CmdletBinding()]
+    param(
+        [string]$InstallPath = $script:TorRepoPath,
+        [int]$IntervalSeconds = 30,
+        [switch]$NoGui,
+        [switch]$PublicApi
+    )
+
+    $resolved = Ensure-TorIPChanger -InstallPath $InstallPath
+    $sourceDir = Join-Path $resolved "source-code"
+    $pythonName = if ($IsWindows) { "python" } else { "python3" }
+    $appPath = Join-Path $sourceDir "ipchanger.py"
+
+    if (-not (Test-Path $appPath)) {
+        throw "Unable to find tor-ip-changer app script at $appPath"
+    }
+
+    $arguments = @(
+        $appPath,
+        "-a",
+        [string]$IntervalSeconds
+    )
+
+    if ($NoGui -or -not $IsWindows) {
+        $arguments += "--nogui"
+    }
+
+    if ($PublicApi) {
+        $arguments += "-p"
+    }
+
+    Write-Host "Starting streamlined TOR IP changer in headless mode..." -ForegroundColor Green
+    $process = Start-Process -FilePath $pythonName -ArgumentList $arguments -WorkingDirectory $sourceDir -PassThru -NoNewWindow
+    Start-Sleep -Seconds 2
+    return $process
+}
+
+function Stop-TorIPChanger {
+    [CmdletBinding()]
+    param()
+
+    $processes = Get-CimInstance Win32_Process -Filter "Name='python.exe' OR Name='python3' OR Name='ipchanger.exe' OR Name='tor.exe'" -ErrorAction SilentlyContinue
+    foreach ($p in $processes) {
+        if ($p.Name -in @("python.exe", "python3", "ipchanger.exe", "tor.exe")) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if ($IsLinux -or $IsMacOS) {
+        & killall tor 2>$null
+        & killall python 2>$null
+        & killall python3 2>$null
+    }
+}
+
+function Get-TorIP {
+    [CmdletBinding()]
+    param(
+        [string]$TimeoutSeconds = 20
+    )
+
+    $pythonName = if ($IsWindows) { "python" } else { "python3" }
+    $requestCode = @'
 import socket
+import urllib.request
+
+socks_host = "127.0.0.1"
+socks_port = 9050
+
 try:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    result = sock.connect_ex(('127.0.0.1', 9050))
-    sock.close()
-    exit(0 if result == 0 else 1)
-except:
-    exit(1)
-"@
+    proxied = urllib.request.ProxyHandler({"http": f"socks5://{socks_host}:{socks_port}", "https": f"socks5://{socks_host}:{socks_port}"})
+    opener = urllib.request.build_opener(proxied)
+    resp = opener.open("http://checkip.amazonaws.com", timeout=15)
+    print(resp.read().decode("utf-8").strip())
+except Exception as e:
+    raise
+'@
 
-$torRunning = python -c $torCheck
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "Tor does not appear to be running on localhost:9050"
-    Write-Host "Ensure Tor is started: sudo service tor start (Linux) or Tor Browser (Windows/Mac)"
+    & $pythonName -c $requestCode 2>$null
 }
 
-# Execute Tor IP changer with optimal tuning
-Write-Host "Starting Tor IP rotation (interval: ${IntervalSeconds}s)..." -ForegroundColor Green
-Write-Host "Press Ctrl+C to stop" -ForegroundColor Yellow
-
-$pythonCmd = @(
-    $torScript
-    "--interval=$IntervalSeconds"
-)
-
-try {
-    & python $pythonCmd
-} catch {
-    Write-Error "Error executing tor-ip-changer: $_"
-    exit 1
-}
+Export-ModuleMember -Function Start-TorIPChanger, Stop-TorIPChanger, Get-TorIP, Ensure-TorIPChanger
