@@ -211,13 +211,82 @@ function Wait-Task {
     # timeout of its own, so a stalled or throttled connection would block
     # GetResult() forever and freeze the run with no output. On timeout the
     # request is cancelled and an exception is thrown for the caller to handle.
-    param($Task, [int]$TimeoutMs, [string]$What)
+    param($Task, $Client, [int]$TimeoutMs, [string]$What)
     $idx = [System.Threading.Tasks.Task]::WaitAny(@($Task), $TimeoutMs)
     if ($idx -eq -1) {
-        try { $ua.CancelAsync() } catch {}
+        try { $Client.CancelAsync() } catch {}
         throw "$What timed out after $([int]($TimeoutMs / 1000))s (connection stalled or throttled)"
     }
     return $Task.GetAwaiter().GetResult()
+}
+
+function New-RegistryClient {
+    # One client per fetch. The tarball is already compressed, so only the
+    # packument fetch advertises gzip (avoids any double-gzip ambiguity).
+    # Stored cookies are replayed so the CDN sees a continuing client instead
+    # of a brand-new one on every request.
+    param([hashtable]$Cookies, [switch]$Gzip)
+    $c = New-Object System.Net.WebClient
+    $c.Headers.Add('User-Agent', $UA)
+    if ($Gzip) { $c.Headers.Add('Accept-Encoding', 'gzip') }
+    if ($Cookies -and $Cookies.Count) {
+        $c.Headers.Add('Cookie', (($Cookies.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; '))
+    }
+    return $c
+}
+
+function Import-SetCookie {
+    # Fold the server's Set-Cookie values into the jar. Multi-cookie headers
+    # arrive comma-joined, and Expires dates contain commas too, so a naive
+    # split is wrong; match name=value pairs and skip the attribute names.
+    param($Client, [hashtable]$Jar)
+    try { $raw = $Client.ResponseHeaders['Set-Cookie'] } catch { return }
+    if (-not $raw) { return }
+    $skip = @('expires', 'path', 'domain', 'max-age', 'samesite', 'secure', 'httponly')
+    foreach ($m in [regex]::Matches($raw, '([A-Za-z0-9_-]+)=([^;,]+)')) {
+        $n = $m.Groups[1].Value
+        if ($skip -notcontains $n.ToLower()) { $Jar[$n] = $m.Groups[2].Value.Trim() }
+    }
+}
+
+function Expand-GzipBody {
+    # Decompress only when the bytes actually are gzip (magic 1F 8B).
+    # Sniffing instead of trusting Content-Encoding means a mislabelled or
+    # already-plain body passes through untouched rather than exploding.
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -gt 2 -and $Bytes[0] -eq 0x1F -and $Bytes[1] -eq 0x8B) {
+        $ms = New-Object System.IO.MemoryStream
+        $src = New-Object System.IO.MemoryStream(,$Bytes)
+        $gz = New-Object System.IO.Compression.GZipStream($src, [System.IO.Compression.CompressionMode]::Decompress)
+        try { $gz.CopyTo($ms) } finally { $gz.Dispose(); $src.Dispose() }
+        return $ms.ToArray()
+    }
+    return $Bytes
+}
+
+function Test-Retryable {
+    # Only network-level failures retry. A 404, an integrity mismatch, or a
+    # corrupt body fails fast — retrying those just burns time and requests.
+    param($Err)
+    $ex = $Err.Exception
+    while ($ex) {
+        if ($ex -is [System.Net.WebException] -and $ex.Response -is [System.Net.HttpWebResponse]) {
+            $code = [int]$ex.Response.StatusCode
+            try { $ex.Response.Close() } catch {}
+            if ($code -eq 429 -or ($code -ge 500 -and $code -lt 600)) { return $true }
+            return $false
+        }
+        $ex = $ex.InnerException
+    }
+    return ('' + $Err.Exception.Message) -match 'timed out after|remote name|could not connect|connection|reset|unreachable|429| 503| 502| 500'
+}
+
+function Save-State {
+    param($Latest, $Integrity, [hashtable]$Jar)
+    Write-Json $stateFile ([pscustomobject]@{
+        latest = $Latest; integrity = $Integrity
+        checkedAt = (Get-Date).ToString('o'); cookies = $Jar
+    })
 }
 
 function Expand-NpmTarball {
@@ -387,11 +456,11 @@ if ($isLocal) {
 # (global) or node_modules\.bin (local). Conflating the two puts a junction on
 # top of the extensionless shim slot and leaves node_modules empty.
 $livePath = Join-Path $npmRoot $Package
-$storeRoot = if ($Store) { $Store } else { Join-Path $globalPrefix ".$Package-store" }
-$pkgStore  = Join-Path $storeRoot $Package
-$stateFile = Join-Path $pkgStore 'state.json'
-$ua = New-Object System.Net.WebClient
-$ua.Headers.Add('User-Agent', $UA)
+$storeRoot  = if ($Store) { $Store } else { Join-Path $globalPrefix ".$Package-store" }
+$pkgStore   = Join-Path $storeRoot $Package
+$stateFile  = Join-Path $pkgStore 'state.json'
+# No shared WebClient: each fetch gets its own (gzip only where it helps),
+# and each carries the cookie jar so the CDN sees a continuing client.
 
 Write-Host ''
 Write-Host '  CODEISOTOPE -- MASTER PURGE + INSTALL (store-backed)' -ForegroundColor White
@@ -406,14 +475,22 @@ Write-Host ''
 Write-Step 'PHASE 1  Discover every trace on disk'
 
 $cached      = Get-Json $stateFile
+$jar = @{}
+if ($cached -and $cached.cookies) {
+    foreach ($cp in $cached.cookies.PSObject.Properties) { $jar[$cp.Name] = [string]$cp.Value }
+}
 $fullyPinned = ($Version -ne '') -and ($Integrity -ne '')
 $freshCache  = ($cached -and $cached.checkedAt -and $cached.latest -and
                 ((Get-Date) - [datetime]$cached.checkedAt).TotalHours -le $MaxAgeHours)
 $needPackument = (-not $fullyPinned) -and ((-not $freshCache) -or $Force)
 # Only open the socket when the answer is actually needed. An unawaited fetch is
 # not free: it costs ~170ms of setup and leaves a request in flight at exit.
-if ($needPackument) { $packTask = $ua.DownloadDataTaskAsync("https://registry.npmjs.org/$Package") }
-Write-Info $(if ($needPackument) { 'packument fetch started (async)' } else { 'packument fetch not needed' })
+$packClient = $null; $packTask = $null
+if ($needPackument) {
+    $packClient = New-RegistryClient $jar -Gzip
+    $packTask = $packClient.DownloadDataTaskAsync("https://registry.npmjs.org/$Package")
+}
+Write-Info $(if ($needPackument) { 'packument fetch started (async, gzip)' } else { 'packument fetch not needed' })
 
 $artifacts = New-Object System.Collections.Generic.List[string]
 if ($Scope -in @('Global', 'Both')) {
@@ -453,16 +530,43 @@ elseif ($freshCache -and -not $Force) {
     Write-Ok "latest from cache ($resolved), checked $(([datetime]$cached.checkedAt).ToString('yyyy-MM-dd HH:mm'))"
 }
 else {
-    try {
-        $pk = [System.Text.Encoding]::UTF8.GetString((Wait-Task $packTask 30000 'packument fetch')) | ConvertFrom-Json
-        $resolved  = if ($Version) { $Version } else { $pk.'dist-tags'.latest }
-        $integrity = if ($Integrity) { $Integrity } else { $pk.versions.$resolved.dist.integrity }
-        $tarball   = $pk.versions.$resolved.dist.tarball
-        Write-Ok "resolved from registry: $resolved"
-    } catch {
-        Write-Err "packument fetch failed: $($_.Exception.Message)"
-        exit 1
+    # Attempt 1 reuses the task started before discovery (the overlap); later
+    # attempts start fresh clients. Byte[] is assigned directly, never passed
+    # through a function pipeline (which would unroll it into loose bytes).
+    $packWire = $null
+    for ($attempt = 1; $attempt -le 3 -and -not $packWire; $attempt++) {
+        try {
+            if ($attempt -eq 1) {
+                $packWire = Wait-Task $packTask $packClient 30000 'packument fetch'
+                Import-SetCookie $packClient $jar
+            } else {
+                $wc = New-RegistryClient $jar -Gzip
+                $t = $wc.DownloadDataTaskAsync("https://registry.npmjs.org/$Package")
+                $packWire = Wait-Task $t $wc 30000 'packument fetch'
+                Import-SetCookie $wc $jar
+            }
+        } catch {
+            if ($attempt -ge 3 -or -not (Test-Retryable $_)) {
+                Write-Err "packument fetch failed: $($_.Exception.Message)"
+                exit 1
+            }
+            $wait = [math]::Pow(2, $attempt)
+            Write-Warn "packument attempt $attempt/3 failed, backing off ${wait}s"
+            Start-Sleep -Seconds $wait
+        }
     }
+    $pkJson = [System.Text.Encoding]::UTF8.GetString((Expand-GzipBody $packWire))
+    Write-Info ("packument {0:N0} bytes on wire -> {1:N0} decoded{2}" -f `
+        $packWire.Length, ([System.Text.Encoding]::UTF8.GetByteCount($pkJson)), `
+        $(if ($packWire[0] -eq 0x1F) { ' (gzip)' } else { ' (plain)' }))
+    $pk = $pkJson | ConvertFrom-Json
+    $resolved  = if ($Version) { $Version } else { $pk.'dist-tags'.latest }
+    $integrity = if ($Integrity) { $Integrity } else { $pk.versions.$resolved.dist.integrity }
+    $tarball   = $pk.versions.$resolved.dist.tarball
+    Write-Ok "resolved from registry: $resolved"
+    # checkedAt is deliberately NOT refreshed here: it marks the last fresh
+    # download (written after a store write), so a new release is re-detected
+    # once the window lapses instead of being pinned forever.
 }
 if (-not $tarball) { $tarball = "https://registry.npmjs.org/$Package/-/$Package-$resolved.tgz" }
 
@@ -538,10 +642,24 @@ if ($storeHit) {
     }
 }
 if (-not $storeHit) {
-    Write-Info "tarball fetch started (async, overlapped with the erase)"
-    $tarTask = $ua.DownloadDataTaskAsync($tarball)
-    try { $bytes = Wait-Task $tarTask 60000 'tarball download' }
-    catch { Write-Err "tarball download failed: $($_.Exception.Message)"; exit 1 }
+    Write-Info "tarball fetch started (cookies replayed: $($jar.Count))"
+    $bytes = $null
+    for ($attempt = 1; $attempt -le 3 -and -not $bytes; $attempt++) {
+        try {
+            $wc = New-RegistryClient $jar
+            $t = $wc.DownloadDataTaskAsync($tarball)
+            $bytes = Wait-Task $t $wc 60000 'tarball download'
+            Import-SetCookie $wc $jar
+        } catch {
+            if ($attempt -ge 3 -or -not (Test-Retryable $_)) {
+                Write-Err "tarball download failed: $($_.Exception.Message)"
+                exit 1
+            }
+            $wait = [math]::Pow(2, $attempt)
+            Write-Warn "tarball attempt $attempt/3 failed, backing off ${wait}s"
+            Start-Sleep -Seconds $wait
+        }
+    }
     Write-Info ("downloaded {0:N0} bytes" -f $bytes.Length)
 
     if ($integrity) {
@@ -575,9 +693,7 @@ if (-not $storeHit) {
         package = $Package; version = $resolved; integrity = $integrity
         tarball = $tarball; files = $n; storedAt = (Get-Date).ToString('o')
     })
-    Write-Json $stateFile ([pscustomobject]@{
-        latest = $resolved; integrity = $integrity; checkedAt = (Get-Date).ToString('o')
-    })
+    Save-State $resolved $integrity $jar
 }
 
 # ---- activate: junction flip, no file writes
