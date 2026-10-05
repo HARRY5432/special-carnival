@@ -224,7 +224,7 @@ function Invoke-ManagedDownload {
     catch {
         $sw.Stop()
         $script:Telemetry.FailureCount++
-        Write-Log 'ERROR' "Download failed for iteration $DownloadNumber: $($_.Exception.Message)"
+        Write-Log 'ERROR' "Download failed for iteration ${DownloadNumber}: $($_.Exception.Message)"
         return $false
     }
     finally {
