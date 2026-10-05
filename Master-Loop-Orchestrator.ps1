@@ -1,9 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    MASTER LOOP ORCHESTRATOR - Production-grade, world-class Tor IP rotation +
-    package download pipeline with configurable repetition, automatic Tor rotation
-    intervals, comprehensive logging, health monitoring, and recovery.
+    MASTER LOOP ORCHESTRATOR - PS5 compatible orchestrator for Tor-backed package runs.
 #>
 
 [CmdletBinding()]
@@ -49,8 +47,8 @@ $script:MasterLogFile = Join-Path $script:LogDir 'master.log'
 $script:CsvLogFile = Join-Path $script:LogDir 'downloads.csv'
 $script:IpLogFile = Join-Path $script:LogDir 'ip-rotations.log'
 $script:HealthLogFile = Join-Path $script:LogDir 'health.log'
-
 $script:TorProxy = 'socks5h://127.0.0.1:9050'
+
 $script:Telemetry = @{
     StartTime = Get-Date
     CurrentIp = $null
@@ -98,19 +96,17 @@ function Invoke-PreflightChecks {
             return $false
         }
     }
-
-    Write-Host "Preflight checks passed." -ForegroundColor Green
+    Write-Host 'Preflight checks passed.' -ForegroundColor Green
     return $true
 }
 
 function Start-ManagedTor {
     if ($DryRun) {
-        Write-Host "[DRY RUN] Would start Tor at 127.0.0.1:9050" -ForegroundColor Yellow
+        Write-Host '[DRY RUN] Would start Tor at 127.0.0.1:9050' -ForegroundColor Yellow
         return $true
     }
 
     Set-TorProxyEnvironment
-
     $modulePath = Join-Path $script:RepoRoot 'TorIPChanger.psm1'
     if (-not (Test-Path $modulePath)) {
         Write-Error "Missing Tor module: $modulePath"
@@ -134,7 +130,7 @@ function Start-ManagedTor {
 
 function Stop-ManagedTor {
     if ($DryRun) {
-        Write-Host "[DRY RUN] Would stop Tor" -ForegroundColor Yellow
+        Write-Host '[DRY RUN] Would stop Tor' -ForegroundColor Yellow
         return $true
     }
 
@@ -152,7 +148,7 @@ function Rotate-TorIp {
     param([int]$RotationNumber)
 
     if ($DryRun) {
-        Write-Host "[DRY RUN] Would rotate Tor IP" -ForegroundColor Yellow
+        Write-Host '[DRY RUN] Would rotate Tor IP' -ForegroundColor Yellow
         return $true
     }
 
@@ -168,18 +164,18 @@ function Rotate-TorIp {
         if ($newIp -and $newIp -ne $oldIp) {
             $script:Telemetry.CurrentIp = $newIp
             $script:Telemetry.RotationCount++
-            $line = "{0},{1},{2},{3},{4}" -f $RotationNumber, $oldIp, $newIp, $sw.ElapsedMilliseconds, 'SUCCESS'
+            $line = '{0},{1},{2},{3},{4}' -f $RotationNumber, $oldIp, $newIp, $sw.ElapsedMilliseconds, 'SUCCESS'
             Add-Content -LiteralPath $script:IpLogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
             return $true
         }
 
-        $line = "{0},{1},{2},{3},{4}" -f $RotationNumber, $oldIp, ($newIp ?? 'UNKNOWN'), $sw.ElapsedMilliseconds, 'FAILED'
+        $line = '{0},{1},{2},{3},{4}' -f $RotationNumber, $oldIp, $newIp, $sw.ElapsedMilliseconds, 'FAILED'
         Add-Content -LiteralPath $script:IpLogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
         return $false
     }
     catch {
         $sw.Stop()
-        $line = "{0},{1},{2},{3},{4}" -f $RotationNumber, $oldIp, 'ERROR', $sw.ElapsedMilliseconds, 'ERROR'
+        $line = '{0},{1},{2},{3},{4}' -f $RotationNumber, $oldIp, 'ERROR', $sw.ElapsedMilliseconds, 'ERROR'
         Add-Content -LiteralPath $script:IpLogFile -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
         return $false
     }
@@ -197,56 +193,22 @@ function Invoke-ManagedDownload {
         return $false
     }
 
-    $args = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $masterScript, '-NoStore', '-Force', '-Quiet'
-    )
-
+    $args = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $masterScript, '-NoStore', '-Force', '-Quiet')
     if ($Version) { $args += @('-Version', $Version) }
     if ($Integrity) { $args += @('-Integrity', $Integrity) }
 
-    $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $processInfo.FileName = 'powershell'
-    $processInfo.ArgumentList.Clear()
-    $processInfo.ArgumentList.Add('-NoProfile')
-    $processInfo.ArgumentList.Add('-ExecutionPolicy')
-    $processInfo.ArgumentList.Add('Bypass')
-    $processInfo.ArgumentList.Add('-File')
-    $processInfo.ArgumentList.Add($masterScript)
-    $processInfo.ArgumentList.Add('-NoStore')
-    $processInfo.ArgumentList.Add('-Force')
-    $processInfo.ArgumentList.Add('-Quiet')
-    if ($Version) {
-        $processInfo.ArgumentList.Add('-Version')
-        $processInfo.ArgumentList.Add($Version)
-    }
-    if ($Integrity) {
-        $processInfo.ArgumentList.Add('-Integrity')
-        $processInfo.ArgumentList.Add($Integrity)
-    }
-    $processInfo.UseShellExecute = $false
-    $processInfo.RedirectStandardOutput = $true
-    $processInfo.RedirectStandardError = $true
-    $processInfo.CreateNoWindow = $true
-    $processInfo.Environment['TOR_PROXY'] = $script:TorProxy
-    $processInfo.Environment['ALL_PROXY'] = $script:TorProxy
-    $processInfo.Environment['HTTP_PROXY'] = $script:TorProxy
-    $processInfo.Environment['HTTPS_PROXY'] = $script:TorProxy
+    $stdoutFile = [System.IO.Path]::GetTempFileName()
+    $stderrFile = [System.IO.Path]::GetTempFileName()
 
     try {
-        $proc = [System.Diagnostics.Process]::Start($processInfo)
-        $exited = $proc.WaitForExit($TimeoutSeconds * 1000)
+        $proc = Start-Process -FilePath 'powershell' -ArgumentList $args -NoNewWindow -PassThru -Wait -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+        $exitCode = $proc.ExitCode
         $sw.Stop()
 
-        $stdout = $proc.StandardOutput.ReadToEnd()
-        $stderr = $proc.StandardError.ReadToEnd()
-        $exitCode = if ($exited) { $proc.ExitCode } else { 124 }
-
-        if (-not $exited) {
-            try { $proc.Kill() } catch {}
-            $script:Telemetry.FailureCount++
-            Add-Content -LiteralPath $script:CsvLogFile -Value "$(Get-Date -Format 'o'),$DownloadNumber,'TIMEOUT',$($sw.ElapsedMilliseconds),$exitCode,$ipStart,$($script:Telemetry.CurrentIp)" -Encoding UTF8 -ErrorAction SilentlyContinue
-            return $false
-        }
+        $stdout = ''
+        $stderr = ''
+        if (Test-Path $stdoutFile) { $stdout = Get-Content -LiteralPath $stdoutFile -Raw }
+        if (Test-Path $stderrFile) { $stderr = Get-Content -LiteralPath $stderrFile -Raw }
 
         if ($exitCode -eq 0) {
             $script:Telemetry.SuccessCount++
@@ -256,6 +218,7 @@ function Invoke-ManagedDownload {
 
         $script:Telemetry.FailureCount++
         Add-Content -LiteralPath $script:CsvLogFile -Value "$(Get-Date -Format 'o'),$DownloadNumber,'FAILED',$($sw.ElapsedMilliseconds),$exitCode,$ipStart,$($script:Telemetry.CurrentIp)" -Encoding UTF8 -ErrorAction SilentlyContinue
+        Write-Log 'ERROR' "Download iteration $DownloadNumber failed with exit code $exitCode. $stderr"
         return $false
     }
     catch {
@@ -263,6 +226,10 @@ function Invoke-ManagedDownload {
         $script:Telemetry.FailureCount++
         Write-Log 'ERROR' "Download failed for iteration $DownloadNumber: $($_.Exception.Message)"
         return $false
+    }
+    finally {
+        if (Test-Path $stdoutFile) { Remove-Item -LiteralPath $stdoutFile -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $stderrFile) { Remove-Item -LiteralPath $stderrFile -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -319,6 +286,6 @@ function Invoke-MasterLoop {
     return $true
 }
 
-Write-Host "Starting Special-Carnival Master Loop Orchestrator..." -ForegroundColor Cyan
+Write-Host 'Starting Special-Carnival Master Loop Orchestrator...' -ForegroundColor Cyan
 $started = Invoke-MasterLoop
 if ($started) { exit 0 } else { exit 1 }
