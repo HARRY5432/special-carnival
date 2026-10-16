@@ -165,7 +165,7 @@ for ($i = 1; $i -le $Times; $i++) {
     if (-not $exited) {
         $timedOut = $true
         try { $pr.Kill() } catch {}
-        $pr.WaitForExit(5000)
+        $null = $pr.WaitForExit(5000)
         $exitCode = 124
     } else {
         $exitCode = $pr.ExitCode
