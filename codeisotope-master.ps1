@@ -1,4 +1,3 @@
-#Requires -Version 5.1
 <#
 .SYNOPSIS
     MASTER command for codeisotope: total purge, integrity-verified install, zero
@@ -80,8 +79,33 @@
 .PARAMETER Force       Kill running <pkg> processes so locks cannot block, and
                        re-resolve latest even if the cache is warm.
 .PARAMETER Quiet       Suppress the banner and per-path chatter.
+.PARAMETER SocksProxy  Optional SOCKS5 proxy in host:port form. When set, all
+                       registry and tarball downloads use curl through that
+                       proxy. This is intended for the Tor IP Changer
+                       integration and is opt-in.
+.PARAMETER CurlPath    curl executable to use with -SocksProxy. Defaults to
+                        curl.exe, which is included with supported Windows
+                        versions and Git for Windows.
+.PARAMETER ZenRows
+                        Opt in to the ZenRows Fetch API for registry metadata and
+                        tarball downloads. Requires the API key in the
+                        ZENROWS_API_KEY environment variable. Mutually exclusive
+                        with -SocksProxy; the key is never printed.
+.PARAMETER ZenRowsPremiumProxy
+                        Ask ZenRows Fetch to use its residential Premium Proxy
+                        pool. Costs 10 credits per successful request; opt in
+                        explicitly so the default ZenRows mode remains cheaper.
+.PARAMETER ZenRowsSessionId
+                        Optional ZenRows session_id. Use one value for the
+                        metadata and tarball of one install so both requests
+                        use a consistent IP. Fresh.ps1 creates a new value per
+                        run when ZenRows mode is enabled.
+.PARAMETER ResolveOnly  Resolve the version, integrity, and tarball URL, print
+                        machine-readable RESOLVED_* lines, and make no install
+                        changes. Used by fresh.ps1's optional pinning mode.
 #>
 
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [ValidateSet('Global', 'Local', 'Both')]
@@ -97,13 +121,52 @@ param(
     [switch]$KeepCache,
     [switch]$DryRun,
     [switch]$Force,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [string]$SocksProxy = '',
+    [string]$CurlPath = 'curl.exe',
+    [Alias('UseZenRows')]
+    [switch]$ZenRows,
+    [switch]$ZenRowsPremiumProxy,
+    [long]$ZenRowsSessionId = 0,
+    [switch]$ResolveOnly
 )
 
 $ErrorActionPreference = 'Continue'
 $Package = 'codeisotope'
 $UA      = 'codeisotope-master'
+$ZenRowsEndpoint = 'https://api.zenrows.com/v1/'
 $sw      = [System.Diagnostics.Stopwatch]::StartNew()
+
+if ($ZenRows -and $SocksProxy) {
+    Write-Host '    [!!] -ZenRows and -SocksProxy cannot be used together.' -ForegroundColor Red
+    exit 1
+}
+$zenRowsApiKey = $null
+if ($ZenRows) {
+    $zenRowsApiKey = [string]$env:ZENROWS_API_KEY
+    if ([string]::IsNullOrWhiteSpace($zenRowsApiKey)) {
+        Write-Host '    [!!] -ZenRows requires the ZENROWS_API_KEY environment variable.' -ForegroundColor Red
+        exit 1
+    }
+    if ($ZenRowsSessionId -le 0) {
+        $ZenRowsSessionId = [math]::Abs([int]([DateTime]::UtcNow.Ticks % 2147483647))
+        if ($ZenRowsSessionId -eq 0) { $ZenRowsSessionId = 1 }
+    }
+}
+
+if ($SocksProxy -and $SocksProxy -notmatch '^[^:\s]+:\d{1,5}$') {
+    Write-Host "    [!!] -SocksProxy must be in host:port form (received '$SocksProxy')." -ForegroundColor Red
+    exit 1
+}
+$resolvedCurl = $null
+if ($SocksProxy) {
+    $curlCommand = Get-Command $CurlPath -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $curlCommand) {
+        Write-Host "    [!!] SOCKS5 downloads require curl; could not find '$CurlPath'." -ForegroundColor Red
+        exit 1
+    }
+    $resolvedCurl = if ($curlCommand.Source) { $curlCommand.Source } else { $curlCommand.Definition }
+}
 
 function Say      { param($m) if (-not $Quiet) { Write-Host $m -ForegroundColor Gray } }
 $script:lastMark = 0
@@ -218,6 +281,98 @@ function Wait-Task {
         throw "$What timed out after $([int]($TimeoutMs / 1000))s (connection stalled or throttled)"
     }
     return $Task.GetAwaiter().GetResult()
+}
+
+function Invoke-SocksDownload {
+    # Windows PowerShell 5.1's WebClient does not speak SOCKS5. Use curl's
+    # native SOCKS5 implementation, write to a temporary file (so PowerShell
+    # cannot reinterpret binary data), then read the bytes back into memory.
+    # --socks5-hostname keeps DNS resolution inside the proxy.
+    param(
+        [string]$Url,
+        [string]$Proxy,
+        [string]$Curl,
+        [int]$TimeoutSeconds
+    )
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('codeisotope-curl-' + [guid]::NewGuid().ToString('N') + '.bin')
+    try {
+        $curlArgs = @(
+            '--fail'
+            '--silent'
+            '--show-error'
+            '--location'
+            '--connect-timeout', '15'
+            '--max-time', [string]$TimeoutSeconds
+            '--socks5-hostname', $Proxy
+            '--output', $tmp
+            $Url
+        )
+        $curlOutput = & $Curl @curlArgs 2>&1
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            $detail = (($curlOutput | ForEach-Object { "$($_)" }) -join ' ').Trim()
+            throw "curl download failed (exit $exitCode)$(if ($detail) { ": $detail" })"
+        }
+        if (-not [System.IO.File]::Exists($tmp)) { throw 'curl produced no output file' }
+        return [System.IO.File]::ReadAllBytes($tmp)
+    }
+    finally {
+        if ([System.IO.File]::Exists($tmp)) {
+            try { [System.IO.File]::Delete($tmp) } catch {}
+        }
+    }
+}
+
+function New-ZenRowsRequestUrl {
+    # Keep the API key in the request URI only. Callers deliberately never log
+    # or include this URI in an error message.
+    param(
+        [string]$TargetUrl,
+        [string]$ApiKey,
+        [string]$Endpoint,
+        [switch]$PremiumProxy,
+        [long]$SessionId = 0
+    )
+    if ([string]::IsNullOrWhiteSpace($ApiKey)) { throw 'ZenRows API key is not configured' }
+    $query = ($Endpoint + '?apikey=' + [System.Uri]::EscapeDataString($ApiKey) +
+              '&url=' + [System.Uri]::EscapeDataString($TargetUrl) +
+              '&original_status=true')
+    if ($PremiumProxy) { $query += '&premium_proxy=true' }
+    if ($SessionId -gt 0) { $query += '&session_id=' + [string]$SessionId }
+    return $query
+}
+
+function New-ZenRowsClient {
+    # Ask ZenRows not to apply an additional HTTP content encoding. The npm
+    # tarball itself is gzip data and must arrive byte-for-byte for sha512.
+    param()
+    $c = New-Object System.Net.WebClient
+    $c.Headers.Add('User-Agent', $UA)
+    $c.Headers.Add('Accept', '*/*')
+    $c.Headers.Add('Accept-Encoding', 'identity')
+    return $c
+}
+
+function Get-ZenRowsErrorMessage {
+    # WebClient rejects non-2xx responses with a WebException. Report the HTTP
+    # status without ever echoing the request URI (which contains the key).
+    param($Err)
+    $ex = $Err.Exception
+    while ($ex) {
+        if ($ex -is [System.Net.WebException]) {
+            if ($ex.Response -is [System.Net.HttpWebResponse]) {
+                $code = [int]$ex.Response.StatusCode
+                $desc = $ex.Response.StatusDescription
+                if ($desc) { return "HTTP $code $desc" }
+                return "HTTP $code"
+            }
+            return "request failed before an HTTP response ($($ex.Status))"
+        }
+        $ex = $ex.InnerException
+    }
+    $msg = [string]$Err.Exception.Message
+    if ($msg -match 'timed out after \d+s') { return $Matches[0] }
+    return 'request failed before an HTTP response'
 }
 
 function New-RegistryClient {
@@ -469,6 +624,11 @@ Say ("  package  : {0}   scope: {1}   version: {2}   mode: {3}" -f `
     $Package, $Scope, $(if ($Version) { $Version } else { 'latest' }), $(if ($DryRun) { 'DRY RUN' } else { 'LIVE' }))
 Say ("  live     : {0}" -f $livePath)
 Say ("  store    : {0}{1}" -f $pkgStore, $(if ($NoStore) { '   (bypassed by -NoStore)' } else { '' }))
+if ($ZenRows) {
+    Say ("  network  : ZenRows Fetch API{0} (session {1})" -f `
+        $(if ($ZenRowsPremiumProxy) { ' + residential Premium Proxy' } else { '' }), $ZenRowsSessionId)
+}
+elseif ($SocksProxy) { Say ("  network  : SOCKS5 $SocksProxy via $resolvedCurl") }
 Write-Host ''
 
 # ===================================================================== 1. DISCOVER
@@ -486,11 +646,22 @@ $needPackument = (-not $fullyPinned) -and ((-not $freshCache) -or $Force)
 # Only open the socket when the answer is actually needed. An unawaited fetch is
 # not free: it costs ~170ms of setup and leaves a request in flight at exit.
 $packClient = $null; $packTask = $null
-if ($needPackument) {
-    $packClient = New-RegistryClient $jar -Gzip
-    $packTask = $packClient.DownloadDataTaskAsync("https://registry.npmjs.org/$Package")
+if ($needPackument -and -not $SocksProxy) {
+    if ($ZenRows) {
+        $packClient = New-ZenRowsClient
+        $packUrl = New-ZenRowsRequestUrl -TargetUrl "https://registry.npmjs.org/$Package" `
+            -ApiKey $zenRowsApiKey -Endpoint $ZenRowsEndpoint `
+            -PremiumProxy:$ZenRowsPremiumProxy -SessionId $ZenRowsSessionId
+        $packTask = $packClient.DownloadDataTaskAsync($packUrl)
+    } else {
+        $packClient = New-RegistryClient $jar -Gzip
+        $packTask = $packClient.DownloadDataTaskAsync("https://registry.npmjs.org/$Package")
+    }
 }
-Write-Info $(if ($needPackument) { 'packument fetch started (async, gzip)' } else { 'packument fetch not needed' })
+Write-Info $(if (-not $needPackument) { 'packument fetch not needed' }
+             elseif ($SocksProxy) { "packument fetch will use SOCKS5 $SocksProxy" }
+             elseif ($ZenRows) { 'packument fetch will use ZenRows Fetch API' }
+             else { 'packument fetch started (async, gzip)' })
 
 $artifacts = New-Object System.Collections.Generic.List[string]
 if ($Scope -in @('Global', 'Both')) {
@@ -536,18 +707,30 @@ else {
     $packWire = $null
     for ($attempt = 1; $attempt -le 3 -and -not $packWire; $attempt++) {
         try {
-            if ($attempt -eq 1) {
+            if ($SocksProxy) {
+                $packWire = Invoke-SocksDownload -Url "https://registry.npmjs.org/$Package" `
+                    -Proxy $SocksProxy -Curl $resolvedCurl -TimeoutSeconds 30
+            } elseif ($attempt -eq 1) {
                 $packWire = Wait-Task $packTask $packClient 30000 'packument fetch'
-                Import-SetCookie $packClient $jar
+                if (-not $ZenRows) { Import-SetCookie $packClient $jar }
             } else {
-                $wc = New-RegistryClient $jar -Gzip
-                $t = $wc.DownloadDataTaskAsync("https://registry.npmjs.org/$Package")
+                if ($ZenRows) {
+                    $wc = New-ZenRowsClient
+                    $packUrl = New-ZenRowsRequestUrl -TargetUrl "https://registry.npmjs.org/$Package" `
+                        -ApiKey $zenRowsApiKey -Endpoint $ZenRowsEndpoint `
+                        -PremiumProxy:$ZenRowsPremiumProxy -SessionId $ZenRowsSessionId
+                } else {
+                    $wc = New-RegistryClient $jar -Gzip
+                    $packUrl = "https://registry.npmjs.org/$Package"
+                }
+                $t = $wc.DownloadDataTaskAsync($packUrl)
                 $packWire = Wait-Task $t $wc 30000 'packument fetch'
-                Import-SetCookie $wc $jar
+                if (-not $ZenRows) { Import-SetCookie $wc $jar }
             }
         } catch {
-            if ($attempt -ge 3 -or -not (Test-Retryable $_)) {
-                Write-Err "packument fetch failed: $($_.Exception.Message)"
+            $zenRowsFailure = if ($ZenRows) { Get-ZenRowsErrorMessage $_ } else { $null }
+            if ($attempt -ge 3 -or ((-not $SocksProxy) -and -not (Test-Retryable $_))) {
+                Write-Err ("packument fetch failed: " + $(if ($ZenRows) { $zenRowsFailure } else { $_.Exception.Message }))
                 exit 1
             }
             $wait = [math]::Pow(2, $attempt)
@@ -555,11 +738,19 @@ else {
             Start-Sleep -Seconds $wait
         }
     }
+    if (-not $packWire -or $packWire.Length -eq 0) {
+        Write-Err 'packument fetch returned an empty response'
+        exit 1
+    }
     $pkJson = [System.Text.Encoding]::UTF8.GetString((Expand-GzipBody $packWire))
     Write-Info ("packument {0:N0} bytes on wire -> {1:N0} decoded{2}" -f `
         $packWire.Length, ([System.Text.Encoding]::UTF8.GetByteCount($pkJson)), `
         $(if ($packWire[0] -eq 0x1F) { ' (gzip)' } else { ' (plain)' }))
-    $pk = $pkJson | ConvertFrom-Json
+    try { $pk = $pkJson | ConvertFrom-Json }
+    catch {
+        Write-Err 'packument response was not valid JSON'
+        exit 1
+    }
     $resolved  = if ($Version) { $Version } else { $pk.'dist-tags'.latest }
     $integrity = if ($Integrity) { $Integrity } else { $pk.versions.$resolved.dist.integrity }
     $tarball   = $pk.versions.$resolved.dist.tarball
@@ -569,6 +760,16 @@ else {
     # once the window lapses instead of being pinned forever.
 }
 if (-not $tarball) { $tarball = "https://registry.npmjs.org/$Package/-/$Package-$resolved.tgz" }
+
+if ($ResolveOnly) {
+    # These stable lines are consumed by fresh.ps1 when -PinResolution is used.
+    # ResolveOnly exits before eradicate/install, so it cannot alter the live
+    # package or the store.
+    Write-Host "RESOLVED_VERSION=$resolved"
+    Write-Host "RESOLVED_INTEGRITY=$integrity"
+    Write-Host "RESOLVED_TARBALL=$tarball"
+    exit 0
+}
 
 # ===================================================================== 2. ERADICATE
 Write-Step 'PHASE 2  Eradicate'
@@ -642,23 +843,42 @@ if ($storeHit) {
     }
 }
 if (-not $storeHit) {
-    Write-Info "tarball fetch started (cookies replayed: $($jar.Count))"
+    Write-Info $(if ($SocksProxy) { "tarball fetch started via SOCKS5 $SocksProxy" }
+                elseif ($ZenRows) { 'tarball fetch started via ZenRows Fetch API' }
+                else { "tarball fetch started (cookies replayed: $($jar.Count))" })
     $bytes = $null
     for ($attempt = 1; $attempt -le 3 -and -not $bytes; $attempt++) {
         try {
-            $wc = New-RegistryClient $jar
-            $t = $wc.DownloadDataTaskAsync($tarball)
-            $bytes = Wait-Task $t $wc 60000 'tarball download'
-            Import-SetCookie $wc $jar
+            if ($SocksProxy) {
+                $bytes = Invoke-SocksDownload -Url $tarball -Proxy $SocksProxy `
+                    -Curl $resolvedCurl -TimeoutSeconds 60
+            } elseif ($ZenRows) {
+                $wc = New-ZenRowsClient
+                $tarballUrl = New-ZenRowsRequestUrl -TargetUrl $tarball `
+                    -ApiKey $zenRowsApiKey -Endpoint $ZenRowsEndpoint `
+                    -PremiumProxy:$ZenRowsPremiumProxy -SessionId $ZenRowsSessionId
+                $t = $wc.DownloadDataTaskAsync($tarballUrl)
+                $bytes = Wait-Task $t $wc 60000 'tarball download'
+            } else {
+                $wc = New-RegistryClient $jar
+                $t = $wc.DownloadDataTaskAsync($tarball)
+                $bytes = Wait-Task $t $wc 60000 'tarball download'
+                Import-SetCookie $wc $jar
+            }
         } catch {
-            if ($attempt -ge 3 -or -not (Test-Retryable $_)) {
-                Write-Err "tarball download failed: $($_.Exception.Message)"
+            $zenRowsFailure = if ($ZenRows) { Get-ZenRowsErrorMessage $_ } else { $null }
+            if ($attempt -ge 3 -or ((-not $SocksProxy) -and -not (Test-Retryable $_))) {
+                Write-Err ("tarball download failed: " + $(if ($ZenRows) { $zenRowsFailure } else { $_.Exception.Message }))
                 exit 1
             }
             $wait = [math]::Pow(2, $attempt)
             Write-Warn "tarball attempt $attempt/3 failed, backing off ${wait}s"
             Start-Sleep -Seconds $wait
         }
+    }
+    if (-not $bytes -or $bytes.Length -eq 0) {
+        Write-Err 'tarball download returned an empty response'
+        exit 1
     }
     Write-Info ("downloaded {0:N0} bytes" -f $bytes.Length)
 

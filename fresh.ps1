@@ -42,10 +42,60 @@
 .PARAMETER Quiet
     Suppress all console output. The log file still records everything.
 
+.PARAMETER UseTor
+    Start the cloned tor-ip-changer runtime, route every CodeIsotope download
+    through its SOCKS5 proxy, and request a new Tor identity between runs. This
+    is opt-in; without this switch the existing direct-download behavior is
+    unchanged.
+
+.PARAMETER UseZenRows
+    Use the ZenRows Fetch API for registry metadata and tarball downloads.
+    Requires ZENROWS_API_KEY in the environment and is mutually exclusive with
+    -UseTor. This is opt-in and leaves the existing direct and Tor paths alone.
+
+.PARAMETER ZenRowsPremiumProxy
+    With -UseZenRows, route requests through ZenRows' residential Premium Proxy
+    pool. Each successful request costs 10 credits instead of the standard one.
+
+.PARAMETER PinResolution
+    Resolve latest/version and integrity once before the loop, then reuse that
+    verified resolution for every run. This removes one metadata request per
+    iteration while still downloading and verifying a fresh tarball every time.
+
+.PARAMETER TorRoot
+    Path to the cloned tor-ip-changer repository. Default is a sibling folder
+    named tor-ip-changer next to this script.
+
+.PARAMETER TorExecutable
+    Optional path to ipchanger.exe. If omitted, the Windows 1.3.0 executable
+    is extracted from TorRoot\dist\1.3.0\ipchanger.rar on first use.
+
+.PARAMETER TorProxyHost / TorProxyPort
+    SOCKS5 endpoint exposed by tor-ip-changer. Defaults to 127.0.0.1:9050.
+
+.PARAMETER TorApiHost / TorApiPort
+    Local API endpoint used to start Tor and rotate identities. Defaults to
+    127.0.0.1:14999.
+
+.PARAMETER TorStartupTimeoutSeconds
+    Maximum time to wait for the API and SOCKS5 listener to open. Default 120.
+
+.PARAMETER TorIdentityTimeoutSeconds
+    Maximum time to wait for one requested identity rotation. Default 120.
+
+.PARAMETER TorDelayIncludesIdentity
+    With -UseTor, count identity-rotation time toward DelaySeconds. The next
+    download still waits for rotation to finish, but the configured delay is
+    measured from the end of the previous download instead of after rotation.
+    This is opt-in; the default keeps the existing Tor pacing.
+
 .EXAMPLE
     .\fresh.ps1
     .\fresh.ps1 -Times 50
     .\fresh.ps1 -Times 10 -Version 0.6.0 -DelaySeconds 5
+    .\fresh.ps1 -Times 50 -UseTor
+    .\fresh.ps1 -Times 50 -UseTor -PinResolution -TorDelayIncludesIdentity
+    .\fresh.ps1 -Times 50 -UseZenRows -ZenRowsPremiumProxy -PinResolution
     .\fresh.ps1 -Log C:\tmp\downloads.log -Quiet
 #>
 
@@ -69,12 +119,60 @@ param(
 
     [switch]$SkipExec,
 
-    [switch]$Quiet
+    [switch]$Quiet,
+
+    [switch]$UseTor,
+
+    [Alias('ZenRows')]
+    [switch]$UseZenRows,
+
+    [switch]$ZenRowsPremiumProxy,
+
+    [switch]$PinResolution,
+
+    [string]$TorRoot = '',
+
+    [string]$TorExecutable = '',
+
+    [string]$TorProxyHost = '127.0.0.1',
+
+    [ValidateRange(1, 65535)]
+    [int]$TorProxyPort = 9050,
+
+    [string]$TorApiHost = '127.0.0.1',
+
+    [ValidateRange(1, 65535)]
+    [int]$TorApiPort = 14999,
+
+    [ValidateRange(10, 900)]
+    [int]$TorStartupTimeoutSeconds = 120,
+
+    [ValidateRange(10, 900)]
+    [int]$TorIdentityTimeoutSeconds = 120,
+
+    [switch]$TorDelayIncludesIdentity
 )
 
 $ErrorActionPreference = 'Stop'
 if (-not $Log) { $Log = Join-Path $PSScriptRoot 'fresh.log' }
 $master = Join-Path $PSScriptRoot 'codeisotope-master.ps1'
+
+if ($UseTor -and $UseZenRows) {
+    Write-Host 'ERROR: -UseTor and -UseZenRows are alternative transports; choose one.' -ForegroundColor Red
+    exit 1
+}
+if ($ZenRowsPremiumProxy -and -not $UseZenRows) {
+    Write-Host 'ERROR: -ZenRowsPremiumProxy requires -UseZenRows.' -ForegroundColor Red
+    exit 1
+}
+if ($UseZenRows -and [string]::IsNullOrWhiteSpace([string]$env:ZENROWS_API_KEY)) {
+    Write-Host 'ERROR: -UseZenRows requires the ZENROWS_API_KEY environment variable.' -ForegroundColor Red
+    exit 1
+}
+if ($TorDelayIncludesIdentity -and -not $UseTor) {
+    Write-Host 'ERROR: -TorDelayIncludesIdentity requires -UseTor.' -ForegroundColor Red
+    exit 1
+}
 
 if (-not (Test-Path -LiteralPath $master)) {
     Write-Host "ERROR: master script not found at $master" -ForegroundColor Red
@@ -84,6 +182,21 @@ if (-not (Test-Path -LiteralPath $master)) {
 $logDir = Split-Path $Log -Parent
 if ($logDir -and -not (Test-Path -LiteralPath $logDir)) {
     New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
+
+$torSession = $null
+if ($UseTor) {
+    $torHelper = Join-Path $PSScriptRoot 'tor-proxy.ps1'
+    if (-not (Test-Path -LiteralPath $torHelper)) {
+        Write-Host "ERROR: Tor integration helper not found at $torHelper" -ForegroundColor Red
+        exit 1
+    }
+    if (-not $TorRoot) { $TorRoot = Join-Path $PSScriptRoot 'tor-ip-changer' }
+    if (-not (Test-Path -LiteralPath $TorRoot -PathType Container)) {
+        Write-Host "ERROR: Tor repository folder not found at $TorRoot" -ForegroundColor Red
+        exit 1
+    }
+    . $torHelper
 }
 
 function Write-LogLine {
@@ -102,6 +215,18 @@ if (-not $Quiet) {
     Write-Host "  scope  : $Scope"
     Write-Host "  delay  : ${DelaySeconds}s between runs"
     Write-Host "  timeout: ${RunTimeoutSeconds}s per run (timed-out runs are killed, logged, skipped)"
+    if ($UseTor) {
+        Write-Host "  network: Tor SOCKS5 ${TorProxyHost}:$TorProxyPort (identity API ${TorApiHost}:$TorApiPort)"
+        Write-Host "  tor    : $TorRoot"
+        if ($TorDelayIncludesIdentity) {
+            Write-Host "  pacing : identity rotation is included in the ${DelaySeconds}s inter-run delay"
+        }
+    } elseif ($UseZenRows) {
+        Write-Host ("  network: ZenRows Fetch API{0}" -f $(if ($ZenRowsPremiumProxy) { ' + residential Premium Proxy' } else { '' }))
+    }
+    if ($PinResolution) {
+        Write-Host '  resolve: package version and integrity resolved once, tarball downloaded every run'
+    }
     Write-Host "  log    : $Log"
     Write-Host ''
 }
@@ -109,8 +234,56 @@ if (-not $Quiet) {
 $totalSw = [System.Diagnostics.Stopwatch]::StartNew()
 $successCount = 0
 $failCount = 0
+$pinnedVersion = $Version
+$pinnedIntegrity = ''
 
-for ($i = 1; $i -le $Times; $i++) {
+try {
+    if ($UseTor) {
+        $torSession = Start-CodeIsotopeTorProxy -TorRoot $TorRoot -ExecutablePath $TorExecutable `
+            -ApiHost $TorApiHost -ApiPort $TorApiPort -ProxyHost $TorProxyHost -ProxyPort $TorProxyPort `
+            -StartupTimeoutSeconds $TorStartupTimeoutSeconds -IdentityTimeoutSeconds $TorIdentityTimeoutSeconds
+    }
+
+    if ($PinResolution) {
+        $resolveArgs = @(
+            '-NoProfile'
+            '-ExecutionPolicy', 'Bypass'
+            '-File', $master
+            '-ResolveOnly'
+            '-Force'
+        )
+        if ($Version) { $resolveArgs += @('-Version', $Version) }
+        if ($UseTor) { $resolveArgs += @('-SocksProxy', "${TorProxyHost}:$TorProxyPort") }
+        if ($UseZenRows) {
+            $resolveArgs += '-ZenRows'
+            if ($ZenRowsPremiumProxy) { $resolveArgs += '-ZenRowsPremiumProxy' }
+        }
+        $resolveOutput = @(& powershell @resolveArgs 2>&1 | ForEach-Object { "$($_)" })
+        $resolveCode = $LASTEXITCODE
+        $resolveText = $resolveOutput -join "`n"
+        if ($resolveCode -ne 0) {
+            # Surface the child diagnostic, but never echo a request URI or an
+            # API key if a transport reports one unexpectedly.
+            $safeDiagnostic = @($resolveOutput |
+                Where-Object { $_ -notmatch '(?i)apikey|ZENROWS_API_KEY|api\.zenrows\.com/v1/\?' } |
+                Select-Object -Last 4) -join ' '
+            if ($safeDiagnostic) {
+                throw "Could not resolve the package before the loop (exit $resolveCode): $safeDiagnostic"
+            }
+            throw "Could not resolve the package before the loop (exit $resolveCode)."
+        }
+        if ($resolveText -notmatch 'RESOLVED_VERSION=([^\s]+)') {
+            throw 'The resolver returned no package version.'
+        }
+        $pinnedVersion = $Matches[1]
+        if ($resolveText -notmatch 'RESOLVED_INTEGRITY=(sha512-[^\s]+)') {
+            throw 'The resolver returned no sha512 integrity value.'
+        }
+        $pinnedIntegrity = $Matches[1]
+        if (-not $Quiet) { Write-Host "  resolved: $pinnedVersion ($pinnedIntegrity)" -ForegroundColor DarkGray }
+    }
+
+    for ($i = 1; $i -le $Times; $i++) {
     $runSw = [System.Diagnostics.Stopwatch]::StartNew()
 
     if (-not $Quiet) {
@@ -127,9 +300,24 @@ for ($i = 1; $i -le $Times; $i++) {
         '-Force'
         '-Scope', $Scope
     )
-    if ($Version) { $psiArgs += @('-Version', $Version) }
+    if ($PinResolution) {
+        $psiArgs += @('-Version', $pinnedVersion, '-Integrity', $pinnedIntegrity)
+    } elseif ($Version) {
+        $psiArgs += @('-Version', $Version)
+    }
     if ($SkipExec) { $psiArgs += '-SkipExec' }
     if ($Quiet) { $psiArgs += '-Quiet' }
+    if ($UseTor) { $psiArgs += @('-SocksProxy', "${TorProxyHost}:$TorProxyPort") }
+    if ($UseZenRows) {
+        $psiArgs += '-ZenRows'
+        if ($ZenRowsPremiumProxy) { $psiArgs += '-ZenRowsPremiumProxy' }
+        # A fresh session per loop iteration keeps the metadata and tarball for
+        # one install consistent while allowing the next install to use a new
+        # residential IP when Premium Proxy is enabled.
+        $zenRowsSessionId = [math]::Abs([int](([DateTime]::UtcNow.Ticks + $i) % 2147483647))
+        if ($zenRowsSessionId -eq 0) { $zenRowsSessionId = 1 }
+        $psiArgs += @('-ZenRowsSessionId', [string]$zenRowsSessionId)
+    }
 
     # Raw .NET Process, not Start-Process: Start-Process -Redirect* never
     # populates .ExitCode on PowerShell 5.1 (it stays empty even after
@@ -164,6 +352,14 @@ for ($i = 1; $i -le $Times; $i++) {
     $exited = $pr.WaitForExit($RunTimeoutSeconds * 1000)
     if (-not $exited) {
         $timedOut = $true
+        # Kill the process tree as well as powershell.exe. The master can have
+        # curl.exe underneath it; leaving that child alive can keep a network
+        # request and its temporary output file open after a timeout.
+        if ($UseTor) {
+            try {
+                & taskkill.exe /PID $pr.Id /T /F 1>$null 2>$null
+            } catch {}
+        }
         try { $pr.Kill() } catch {}
         $null = $pr.WaitForExit(5000)
         $exitCode = 124
@@ -197,8 +393,8 @@ for ($i = 1; $i -le $Times; $i++) {
             Write-Host " done  ver=$resolvedVer  $($runSw.ElapsedMilliseconds)ms" -ForegroundColor Green
         } elseif ($timedOut) {
             Write-Host " TIMEOUT after ${RunTimeoutSeconds}s (child killed, continuing)" -ForegroundColor Yellow
-        } else {
-            Write-Host " FAILED  exit=$exitCode  $($runSw.ElapsedMilliseconds)ms" -ForegroundColor Red
+    } else {
+        Write-Host " FAILED  exit=$exitCode  $($runSw.ElapsedMilliseconds)ms" -ForegroundColor Red
             if ($stderr) {
                 $errLines = ($stderr -split "`n" | Where-Object { $_.Trim() } | Select-Object -First 3)
                 foreach ($el in $errLines) { Write-Host "         $el" -ForegroundColor DarkRed }
@@ -206,9 +402,32 @@ for ($i = 1; $i -le $Times; $i++) {
         }
     }
 
-    if ($i -lt $Times) {
-        Start-Sleep -Seconds $DelaySeconds
+    # Release the native process handle on every iteration. This matters for
+    # long Tor loops and does not alter the direct or Tor download contract.
+    $pr.Dispose()
+    $pr = $null
+
+        if ($i -lt $Times) {
+            if ($UseTor) {
+                $identitySw = [System.Diagnostics.Stopwatch]::StartNew()
+                $null = Request-CodeIsotopeTorIdentity -Session $torSession -TimeoutSeconds $TorIdentityTimeoutSeconds
+                $identitySw.Stop()
+                if ($TorDelayIncludesIdentity) {
+                    $remainingDelayMs = ($DelaySeconds * 1000) - $identitySw.ElapsedMilliseconds
+                    if ($remainingDelayMs -gt 0) {
+                        Start-Sleep -Milliseconds ([int]$remainingDelayMs)
+                    }
+                } else {
+                    Start-Sleep -Seconds $DelaySeconds
+                }
+            } else {
+                Start-Sleep -Seconds $DelaySeconds
+            }
+        }
     }
+}
+finally {
+    if ($torSession) { $null = Stop-CodeIsotopeTorProxy -Session $torSession }
 }
 
 $totalSw.Stop()
